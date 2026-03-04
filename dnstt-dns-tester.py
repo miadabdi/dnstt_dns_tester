@@ -421,7 +421,7 @@ def main():
     p.add_argument(
         "--startup-wait",
         type=float,
-        default=4.0,
+        default=2.0,
         help="Seconds to wait for dnstt-client startup (default: 4.0)",
     )
     p.add_argument(

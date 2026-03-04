@@ -26,9 +26,10 @@ Filter your DNS list to only those servers that respond:
 python3 dnstt-dns-liveness.py \
     --dns-list all_dns.txt \
     --output alive_dns.txt \
-    --batch 50 \
-    --concurrent 20 \
-    --timeout 5
+    --batch 200 \
+    --concurrent 50 \
+    --timeout 5 \
+    --hide-failed
 ```
 
 Key options:
@@ -50,10 +51,11 @@ Test alive servers for actual dnstt tunnel connectivity:
 
 ```bash
 python3 dnstt-dns-tester.py \
+    --dnstt PATH_TO_DNSTT_BINARY \
     --dns-list alive_dns.txt \
     --pubkey YOUR_PUBLIC_KEY \
     --domain your.dnstt.domain \
-    --max-concurrent 3 \
+    --max-concurrent 10 \
     --attempts 2
 ```
 

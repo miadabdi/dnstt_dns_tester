@@ -1,0 +1,31 @@
+dnstt-client-linux-amd64
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Output files
+alive_dns*.txt
+working_dns*.txt
+dns_test_results*.json
+
+# Temp files
+/tmp/dnstt_stderr_*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

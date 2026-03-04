@@ -26,8 +26,7 @@ Filter your DNS list to only those servers that respond:
 python3 dnstt-dns-liveness.py \
     --dns-list all_dns.txt \
     --output alive_dns.txt \
-    --batch 200 \
-    --concurrent 50 \
+    --concurrent 200 \
     --timeout 5 \
     --hide-failed
 ```
@@ -39,8 +38,7 @@ Key options:
 | `--dns-list`    | `dns-servers.txt`       | Input file with DNS IPs (one per line) |
 | `--output`      | `alive_dns_servers.txt` | Output file for alive IPs              |
 | `--output-json` | _(none)_                | Save full results as JSON              |
-| `--batch`       | 30                      | IPs per batch                          |
-| `--concurrent`  | 15                      | Max parallel checks                    |
+| `--concurrent`  | 50                      | Max parallel checks                    |
 | `--timeout`     | 5.0                     | Seconds per query                      |
 | `--attempts`    | 1                       | Retries per server                     |
 | `--hide-failed` | off                     | Suppress failed-server output          |

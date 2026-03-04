@@ -77,7 +77,6 @@ class DnsLivenessTester:
         self,
         dns_list_path: str,
         dns_port: int = 53,
-        batch_size: int = 30,
         concurrent: int = 15,
         timeout: float = 5.0,
         attempts: int = 1,
@@ -85,7 +84,6 @@ class DnsLivenessTester:
     ):
         self.dns_list_path = dns_list_path
         self.dns_port = dns_port
-        self.batch_size = batch_size
         self.concurrent = concurrent
         self.timeout = timeout
         self.attempts = attempts
@@ -132,24 +130,6 @@ class DnsLivenessTester:
             "error": last_error,
         }
 
-    def _test_batch(self, servers: List[str]) -> List[Dict]:
-        results: List[Dict] = []
-        with ThreadPoolExecutor(max_workers=self.concurrent) as executor:
-            futures = {executor.submit(self._test_single, s): s for s in servers}
-            for future in as_completed(futures):
-                dns = futures[future]
-                try:
-                    res = future.result(timeout=self.timeout + 5)
-                except Exception as e:
-                    res = {
-                        "dns_server": dns,
-                        "alive": False,
-                        "dns_response_time": None,
-                        "error": str(e)[:120],
-                    }
-                results.append(res)
-        return results
-
     @property
     def partial_results(self) -> List[Dict]:
         """Return results collected so far (useful when interrupted)."""
@@ -159,7 +139,6 @@ class DnsLivenessTester:
         total = len(self.dns_servers)
         print(f"DNS liveness check on {total} servers")
         print(f"  DNS port:    {self.dns_port}")
-        print(f"  Batch size:  {self.batch_size}")
         print(f"  Concurrent:  {self.concurrent}")
         print(f"  Timeout:     {self.timeout}s")
         print(f"  Attempts:    {self.attempts}")
@@ -168,41 +147,47 @@ class DnsLivenessTester:
 
         self._all_results: List[Dict] = []
         all_results = self._all_results
+        completed = 0
         total_alive = 0
-        total_dead = 0
 
-        for batch_start in range(0, total, self.batch_size):
-            batch = self.dns_servers[batch_start : batch_start + self.batch_size]
-            batch_end = min(batch_start + self.batch_size, total)
-            print(
-                f"\n--- Batch [{batch_start + 1}-{batch_end}] / {total}  "
-                f"({len(batch)} servers) ---"
-            )
+        with ThreadPoolExecutor(max_workers=self.concurrent) as executor:
+            futures = {
+                executor.submit(self._test_single, s): s for s in self.dns_servers
+            }
+            for future in as_completed(futures):
+                dns = futures[future]
+                try:
+                    r = future.result(timeout=self.timeout + 5)
+                except Exception as e:
+                    r = {
+                        "dns_server": dns,
+                        "alive": False,
+                        "dns_response_time": None,
+                        "error": str(e)[:120],
+                    }
 
-            results = self._test_batch(batch)
+                all_results.append(r)
+                completed += 1
 
-            alive = 0
-            dead = 0
-            for r in results:
                 if r["alive"]:
-                    alive += 1
+                    total_alive += 1
                     t = (
                         f"{r['dns_response_time']:.3f}s"
                         if r["dns_response_time"]
                         else "N/A"
                     )
-                    print(f"  OK   {r['dns_server']:>18}  DNS reply in {t}")
+                    print(
+                        f"[{completed:5d}/{total}]  OK   {r['dns_server']:>18}"
+                        f"  DNS reply in {t}"
+                    )
                 else:
-                    dead += 1
                     if not self.hide_failed:
-                        print(f"  FAIL {r['dns_server']:>18}  {r['error']}")
+                        print(
+                            f"[{completed:5d}/{total}]  FAIL {r['dns_server']:>18}"
+                            f"  {r['error']}"
+                        )
 
-            total_alive += alive
-            total_dead += dead
-            print(f"  Batch result: {alive} alive, {dead} dead")
-
-            all_results.extend(results)
-
+        total_dead = total - total_alive
         print("\n" + "=" * 70)
         print(f"TOTAL: {total_alive} alive, {total_dead} dead out of {total}")
         print("=" * 70)
@@ -245,16 +230,10 @@ def main():
         help="DNS port (default: 53)",
     )
     p.add_argument(
-        "--batch",
-        type=int,
-        default=30,
-        help="Number of IPs per batch (default: 30)",
-    )
-    p.add_argument(
         "--concurrent",
         type=int,
-        default=15,
-        help="Max concurrent checks (default: 15)",
+        default=50,
+        help="Max concurrent checks (default: 50)",
     )
     p.add_argument(
         "--timeout",
@@ -290,7 +269,6 @@ def main():
     tester = DnsLivenessTester(
         dns_list_path=args.dns_list,
         dns_port=args.dns_port,
-        batch_size=args.batch,
         concurrent=args.concurrent,
         timeout=args.timeout,
         attempts=args.attempts,

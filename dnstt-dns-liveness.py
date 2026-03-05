@@ -20,8 +20,11 @@ from typing import Dict, List, Optional
 # ---------------------------------------------------------------------------
 
 
-def _build_dns_query(domain: str = "www.gstatic.com", qtype: int = 1) -> bytes:
-    """Build a minimal DNS A-record query packet."""
+def _build_dns_query(domain: str = "www.gstatic.com", qtype: int = 1) -> tuple:
+    """Build a minimal DNS A-record query packet.
+
+    Returns (packet_bytes, transaction_id).
+    """
     import random
 
     tx_id = random.randint(0, 0xFFFF)
@@ -32,20 +35,61 @@ def _build_dns_query(domain: str = "www.gstatic.com", qtype: int = 1) -> bytes:
         question += bytes([len(label)]) + label.encode()
     question += b"\x00"
     question += struct.pack(">HH", qtype, 1)  # A record, IN class
-    return header + question
+    return header + question, tx_id
+
+
+def _validate_dns_response(data: bytes, expected_tx_id: int) -> Optional[str]:
+    """Validate that *data* is a well-formed DNS response.
+
+    Returns ``None`` on success or an error string describing the problem.
+    """
+    if len(data) < 12:
+        return "response too short"
+
+    tx_id, flags, qd_count, an_count, ns_count, ar_count = struct.unpack(
+        ">HHHHHH", data[:12]
+    )
+
+    # Transaction-ID must match the query we sent
+    if tx_id != expected_tx_id:
+        return f"tx-id mismatch (got 0x{tx_id:04x}, expected 0x{expected_tx_id:04x})"
+
+    # QR bit (bit 15) must be 1 → this is a response
+    if not (flags & 0x8000):
+        return "QR bit not set (not a DNS response)"
+
+    # RCODE is the low 4 bits of the flags field
+    rcode = flags & 0x000F
+    if rcode not in (0, 3):  # NOERROR or NXDOMAIN are both valid DNS behaviour
+        rcode_names = {1: "FORMERR", 2: "SERVFAIL", 4: "NOTIMP", 5: "REFUSED"}
+        name = rcode_names.get(rcode, f"RCODE={rcode}")
+        return f"DNS error: {name}"
+
+    # For NOERROR we expect at least one answer (NXDOMAIN may have zero answers)
+    if rcode == 0 and an_count == 0 and qd_count > 0:
+        return "no answer records in NOERROR response"
+
+    return None  # all good
 
 
 def dns_liveness_check(
     dns_server: str,
     dns_port: int = 53,
     timeout: float = 5.0,
-    query_domain: str = "www.gstatic.com",
+    query_domain: str = "www.google.com",
 ) -> Dict:
     """
-    Send a simple UDP DNS query and wait for *any* response.
+    Send a UDP DNS query and validate that the response is a correct DNS reply.
+
+    Checks performed on the response:
+      - Transaction-ID matches the query
+      - QR bit is set (it is a response, not another query)
+      - RCODE is acceptable (NOERROR or NXDOMAIN)
+      - For NOERROR responses, at least one answer record exists
+
     Returns a dict with 'alive', 'response_time', 'error'.
     """
-    packet = _build_dns_query(query_domain)
+    packet, tx_id = _build_dns_query(query_domain)
     start = time.time()
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -53,9 +97,11 @@ def dns_liveness_check(
         sock.sendto(packet, (dns_server, dns_port))
         data, _ = sock.recvfrom(1024)
         elapsed = time.time() - start
-        if len(data) >= 12:
+
+        err = _validate_dns_response(data, tx_id)
+        if err is None:
             return {"alive": True, "response_time": elapsed, "error": None}
-        return {"alive": False, "response_time": elapsed, "error": "response too short"}
+        return {"alive": False, "response_time": elapsed, "error": err}
     except socket.timeout:
         return {"alive": False, "response_time": None, "error": "timeout"}
     except Exception as e:

@@ -72,6 +72,13 @@ class DnsttDnsTester:
                 servers.append(line)
         return servers
 
+    @staticmethod
+    def _find_free_port() -> int:
+        """Ask the OS for a free TCP port on 127.0.0.1."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
     def _is_port_open(self, port: int, timeout: float = 2.0) -> bool:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -93,8 +100,8 @@ class DnsttDnsTester:
             time.sleep(interval)
         return False
 
-    def test_single_dns(self, test_id: int, dns_server: str) -> Dict:
-        socks_port = 40000 + test_id
+    def test_single_dns(self, dns_server: str) -> Dict:
+        socks_port = self._find_free_port()
         dnstt_process = None
         session = None
         stderr_file = None
@@ -114,7 +121,7 @@ class DnsttDnsTester:
             ]
 
             # Use a temp file for stderr to avoid pipe FD leaks
-            stderr_file = open(f"/tmp/dnstt_stderr_{test_id}.log", "w+b")
+            stderr_file = open(f"/tmp/dnstt_stderr_{socks_port}.log", "w+b")
 
             dnstt_process = subprocess.Popen(
                 cmd,
@@ -242,7 +249,7 @@ class DnsttDnsTester:
                 except Exception:
                     pass
                 try:
-                    os.unlink(f"/tmp/dnstt_stderr_{test_id}.log")
+                    os.unlink(f"/tmp/dnstt_stderr_{socks_port}.log")
                 except Exception:
                     pass
 
@@ -266,8 +273,8 @@ class DnsttDnsTester:
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
             futures = {
-                executor.submit(self.test_single_dns, i, dns): dns
-                for i, dns in enumerate(self.dns_servers)
+                executor.submit(self.test_single_dns, dns): dns
+                for dns in self.dns_servers
             }
 
             for future in as_completed(futures):
@@ -311,7 +318,11 @@ class DnsttDnsTester:
                 )
                 err = ""
                 if not result["success"] and result.get("error"):
-                    err = f" | {result['error']}"
+                    err_msg = result["error"]
+                    # Truncate long error messages for readable output
+                    if len(err_msg) > 80:
+                        err_msg = err_msg[:77] + "..."
+                    err = f" | {err_msg}"
 
                 print(
                     f"[{completed:3d}/{total}] {status:4s} {result['dns_server']:>18} | "

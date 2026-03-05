@@ -583,7 +583,7 @@ def main():
     p.add_argument(
         "--domain",
         required=True,
-        help="dnstt domain (e.g. n.mlfrontier.store)",
+        help="dnstt domain",
     )
     p.add_argument(
         "--dns-port",

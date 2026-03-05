@@ -11,11 +11,20 @@ A two-stage toolkit for finding DNS servers that work with [dnstt](https://www.b
 
 Stage 1 validates responses properly (transaction ID, QR bit, RCODE, answer records) — not just "did something reply on port 53".
 
+## Cross-Platform Support
+
+Both scripts run on **Linux**, **macOS**, and **Windows**. Platform-specific
+details (process management, file-descriptor limits, temp paths) are handled
+automatically.
+
+> On macOS or Windows you must compile or download the appropriate `dnstt-client`
+> binary yourself and pass it via `--dnstt`.
+
 ## Requirements
 
 - Python 3.7+
 - `requests` with SOCKS support (`pip install requests[socks]`)
-- A compiled `dnstt-client` binary (included: `dnstt-client-linux-amd64`)
+- A compiled `dnstt-client` binary for your platform
 - A working dnstt server with its public key and domain
 
 ## Quick Start

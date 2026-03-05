@@ -10,7 +10,6 @@ then be fed into dnstt-dns-tester.py for Stage 2 (dnstt connectivity testing).
 import argparse
 import json
 import random
-import resource
 import shutil
 import socket
 import struct
@@ -18,6 +17,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
+
+_IS_WIN = sys.platform == "win32"
 
 # ---------------------------------------------------------------------------
 # DNS liveness helpers
@@ -93,6 +94,7 @@ def dns_liveness_check(
     """
     packet, tx_id = _build_dns_query(query_domain)
     start = time.time()
+    sock: socket.socket | None = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
@@ -115,7 +117,8 @@ def dns_liveness_check(
         return {"alive": False, "response_time": None, "error": str(e)[:120]}
     finally:
         try:
-            sock.close()
+            if sock is not None:
+                sock.close()
         except Exception:
             pass
 
@@ -130,6 +133,20 @@ class _Colors:
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
+        # Enable ANSI escape processing on Windows 10+
+        if enabled and _IS_WIN:
+            try:
+                import ctypes
+
+                k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+                h = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+                mode = ctypes.c_ulong()
+                k32.GetConsoleMode(h, ctypes.byref(mode))
+                k32.SetConsoleMode(
+                    h, mode.value | 0x0004
+                )  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            except Exception:
+                self.enabled = False  # fallback: disable colors
 
     def _w(self, code: str, text: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self.enabled else str(text)
@@ -372,14 +389,17 @@ class DnsLivenessTester:
 
 
 def main():
-    # Raise open file limit to handle high concurrency (many UDP sockets)
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        desired = min(hard, max(65536, soft))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
-        print(f"File descriptor limit: {desired} (was {soft})")
-    except Exception as e:
-        print(f"Warning: could not raise file descriptor limit: {e}")
+    # Raise open file limit (Linux/macOS only)
+    if not _IS_WIN:
+        try:
+            import resource as _resource
+
+            soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+            desired = min(hard, max(65536, soft))
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (desired, hard))
+            print(f"File descriptor limit: {desired} (was {soft})")
+        except Exception as e:
+            print(f"Warning: could not raise file descriptor limit: {e}")
 
     p = argparse.ArgumentParser(
         description="Stage 1: DNS liveness checker — test which DNS servers respond to queries"

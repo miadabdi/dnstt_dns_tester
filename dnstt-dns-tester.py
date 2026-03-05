@@ -7,15 +7,17 @@ if traffic can flow through it.
 
 import json
 import os
-import resource
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from typing import Dict, List
+
+_IS_WIN = sys.platform == "win32"
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -41,6 +43,20 @@ class _Colors:
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
+        # Enable ANSI escape processing on Windows 10+
+        if enabled and _IS_WIN:
+            try:
+                import ctypes
+
+                k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+                h = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+                mode = ctypes.c_ulong()
+                k32.GetConsoleMode(h, ctypes.byref(mode))
+                k32.SetConsoleMode(
+                    h, mode.value | 0x0004
+                )  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            except Exception:
+                self.enabled = False  # fallback: disable colors
 
     def _w(self, code: str, text: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self.enabled else str(text)
@@ -179,6 +195,7 @@ class DnsttDnsTester:
         dnstt_process = None
         session = None
         stderr_file = None
+        stderr_path = ""
 
         dns_target = f"{dns_server}:{self.dns_port}"
 
@@ -195,14 +212,21 @@ class DnsttDnsTester:
             ]
 
             # Use a temp file for stderr to avoid pipe FD leaks
-            stderr_file = open(f"/tmp/dnstt_stderr_{socks_port}.log", "w+b")
+            stderr_path = os.path.join(
+                tempfile.gettempdir(), f"dnstt_stderr_{socks_port}.log"
+            )
+            stderr_file = open(stderr_path, "w+b")
 
-            dnstt_process = subprocess.Popen(
-                cmd,
+            popen_kwargs: Dict = dict(
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_file,
-                preexec_fn=os.setsid,
             )
+            if _IS_WIN:
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["preexec_fn"] = os.setsid
+
+            dnstt_process = subprocess.Popen(cmd, **popen_kwargs)
 
             # Wait for dnstt-client to start up and open the SOCKS port
             port_ready = self._wait_for_port(socks_port, timeout=self.startup_wait + 5)
@@ -303,12 +327,20 @@ class DnsttDnsTester:
 
             if dnstt_process and dnstt_process.poll() is None:
                 try:
-                    os.killpg(os.getpgid(dnstt_process.pid), signal.SIGTERM)
-                    try:
-                        dnstt_process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(os.getpgid(dnstt_process.pid), signal.SIGKILL)
-                        dnstt_process.wait(timeout=2)
+                    if _IS_WIN:
+                        dnstt_process.terminate()
+                        try:
+                            dnstt_process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            dnstt_process.kill()
+                            dnstt_process.wait(timeout=2)
+                    else:
+                        os.killpg(os.getpgid(dnstt_process.pid), signal.SIGTERM)
+                        try:
+                            dnstt_process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(os.getpgid(dnstt_process.pid), signal.SIGKILL)
+                            dnstt_process.wait(timeout=2)
                 except Exception:
                     try:
                         dnstt_process.kill()
@@ -323,7 +355,7 @@ class DnsttDnsTester:
                 except Exception:
                     pass
                 try:
-                    os.unlink(f"/tmp/dnstt_stderr_{socks_port}.log")
+                    os.unlink(stderr_path)
                 except Exception:
                     pass
 
@@ -518,14 +550,17 @@ class DnsttDnsTester:
 def main():
     import argparse
 
-    # Raise open file limit to handle many concurrent subprocesses
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        desired = min(hard, max(65536, soft))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
-        print(f"File descriptor limit: {desired} (was {soft})")
-    except Exception as e:
-        print(f"Warning: could not raise file descriptor limit: {e}")
+    # Raise open file limit (Linux/macOS only)
+    if not _IS_WIN:
+        try:
+            import resource as _resource
+
+            soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+            desired = min(hard, max(65536, soft))
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (desired, hard))
+            print(f"File descriptor limit: {desired} (was {soft})")
+        except Exception as e:
+            print(f"Warning: could not raise file descriptor limit: {e}")
 
     p = argparse.ArgumentParser(
         description="Test DNS servers for dnstt-client connectivity"
@@ -626,7 +661,7 @@ def main():
         print(f"Error: dnstt binary not found: {args.dnstt}")
         sys.exit(1)
 
-    if not os.access(args.dnstt, os.X_OK):
+    if not _IS_WIN and not os.access(args.dnstt, os.X_OK):
         print(f"Error: dnstt binary is not executable: {args.dnstt}")
         sys.exit(1)
 

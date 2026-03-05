@@ -9,6 +9,8 @@ then be fed into dnstt-dns-tester.py for Stage 2 (dnstt connectivity testing).
 
 import argparse
 import json
+import random
+import resource
 import socket
 import struct
 import time
@@ -25,8 +27,6 @@ def _build_dns_query(domain: str = "www.gstatic.com", qtype: int = 1) -> tuple:
 
     Returns (packet_bytes, transaction_id).
     """
-    import random
-
     tx_id = random.randint(0, 0xFFFF)
     flags = 0x0100  # standard query, recursion desired
     header = struct.pack(">HHHHHH", tx_id, flags, 1, 0, 0, 0)
@@ -94,6 +94,11 @@ def dns_liveness_check(
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
+        # Increase receive buffer to reduce drops under high concurrency
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        except OSError:
+            pass
         sock.sendto(packet, (dns_server, dns_port))
         data, _ = sock.recvfrom(1024)
         elapsed = time.time() - start
@@ -125,7 +130,7 @@ class DnsLivenessTester:
         dns_port: int = 53,
         concurrent: int = 15,
         timeout: float = 5.0,
-        attempts: int = 1,
+        attempts: int = 2,
         hide_failed: bool = False,
     ):
         self.dns_list_path = dns_list_path
@@ -148,10 +153,16 @@ class DnsLivenessTester:
         return servers
 
     def _test_single(self, dns_server: str) -> Dict:
+        # Random jitter (0-50ms) to avoid UDP burst congestion at high concurrency
+        time.sleep(random.uniform(0, 0.05))
+
         best_time: Optional[float] = None
         last_error: Optional[str] = None
 
-        for _ in range(self.attempts):
+        for attempt in range(self.attempts):
+            # Small delay between retries to avoid hitting the same congestion
+            if attempt > 0:
+                time.sleep(random.uniform(0.1, 0.5))
             result = dns_liveness_check(
                 dns_server,
                 dns_port=self.dns_port,
@@ -261,6 +272,15 @@ class DnsLivenessTester:
 
 
 def main():
+    # Raise open file limit to handle high concurrency (many UDP sockets)
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired = min(hard, max(65536, soft))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+        print(f"File descriptor limit: {desired} (was {soft})")
+    except Exception as e:
+        print(f"Warning: could not raise file descriptor limit: {e}")
+
     p = argparse.ArgumentParser(
         description="Stage 1: DNS liveness checker — test which DNS servers respond to queries"
     )
@@ -290,8 +310,8 @@ def main():
     p.add_argument(
         "--attempts",
         type=int,
-        default=1,
-        help="Number of query attempts per server (default: 1)",
+        default=2,
+        help="Number of query attempts per server (default: 2)",
     )
     p.add_argument(
         "--output",

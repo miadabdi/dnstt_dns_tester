@@ -27,6 +27,28 @@ automatically.
 - A compiled `dnstt-client` binary for your platform
 - A working dnstt server with its public key and domain
 
+## Installation
+
+Two install modes are supported:
+
+- Online (preferred): installs from PyPI using `requirements.txt`.
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+- Offline (no internet): use the bundled wheels in `vendor/`.
+
+```bash
+ # Unix
+ bash install_deps.sh
+
+ # Windows (cmd.exe)
+ install_deps.bat
+```
+
+The installer scripts will try an online `pip install -r requirements.txt` first and automatically fall back to the `vendor/` wheels if offline.
+
 ## Quick Start
 
 ### Stage 1 — DNS Liveness Check

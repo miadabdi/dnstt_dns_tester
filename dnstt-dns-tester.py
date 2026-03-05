@@ -8,6 +8,7 @@ if traffic can flow through it.
 import json
 import os
 import resource
+import shutil
 import signal
 import socket
 import subprocess
@@ -30,6 +31,53 @@ class TimeoutHTTPAdapter(HTTPAdapter):
         return super().send(request, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# TUI helpers
+# ---------------------------------------------------------------------------
+
+
+class _Colors:
+    """ANSI color helper — disabled when output is not a terminal."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+
+    def _w(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else str(text)
+
+    def green(self, t):
+        return self._w("32", t)
+
+    def red(self, t):
+        return self._w("31", t)
+
+    def yellow(self, t):
+        return self._w("33", t)
+
+    def bold(self, t):
+        return self._w("1", t)
+
+    def dim(self, t):
+        return self._w("2", t)
+
+
+def _format_duration(seconds: float) -> str:
+    """Human-readable duration string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    h = s // 3600
+    m = (s % 3600) // 60
+    return f"{h}h{m:02d}m"
+
+
+# ---------------------------------------------------------------------------
+# Tester
+# ---------------------------------------------------------------------------
+
+
 class DnsttDnsTester:
     def __init__(
         self,
@@ -45,6 +93,8 @@ class DnsttDnsTester:
         test_timeout: float = 90.0,
         attempts: int = 2,
         test_url: str = "https://www.gstatic.com/generate_204",
+        show_failed: bool = False,
+        use_color: bool = True,
     ):
         self.dnstt_path = os.path.abspath(dnstt_path)
         self.dns_list_path = dns_list_path
@@ -58,6 +108,8 @@ class DnsttDnsTester:
         self.test_timeout = test_timeout
         self.attempts = attempts
         self.test_url = test_url
+        self.show_failed = show_failed
+        self.use_color = use_color and sys.stdout.isatty()
 
         self.dns_servers = self._load_dns_servers()
 
@@ -72,12 +124,34 @@ class DnsttDnsTester:
                 servers.append(line)
         return servers
 
-    @staticmethod
-    def _find_free_port() -> int:
-        """Ask the OS for a free TCP port on 127.0.0.1."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
+    import threading
+
+    _port_lock = threading.Lock()
+    _reserved_ports: set = set()
+
+    @classmethod
+    def _find_free_port(cls) -> int:
+        """Ask the OS for a free TCP port on 127.0.0.1, ensuring no two
+        threads get the same port before dnstt-client can bind it."""
+        with cls._port_lock:
+            for _ in range(50):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("127.0.0.1", 0))
+                    port = s.getsockname()[1]
+                if port not in cls._reserved_ports:
+                    cls._reserved_ports.add(port)
+                    return port
+            # fallback: return whatever the OS gives, even if duplicated
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            cls._reserved_ports.add(port)
+            return port
+
+    @classmethod
+    def _release_port(cls, port: int):
+        with cls._port_lock:
+            cls._reserved_ports.discard(port)
 
     def _is_port_open(self, port: int, timeout: float = 2.0) -> bool:
         try:
@@ -253,11 +327,18 @@ class DnsttDnsTester:
                 except Exception:
                     pass
 
+            # Release port reservation so other threads can reuse it
+            self._release_port(socks_port)
+
             time.sleep(0.3)
 
     def run_tests(self) -> List[Dict]:
         total = len(self.dns_servers)
-        print(f"Testing {total} DNS servers against dnstt")
+        C = _Colors(self.use_color)
+        is_tty = sys.stdout.isatty()
+        term_width = shutil.get_terminal_size((80, 24)).columns
+
+        print(f"Testing {C.bold(str(total))} DNS servers against dnstt")
         print(f"  Domain:     {self.domain}")
         print(f"  Protocol:   {self.protocol}")
         print(f"  DNS port:   {self.dns_port}")
@@ -270,6 +351,43 @@ class DnsttDnsTester:
         self._results: List[Dict] = []
         results = self._results
         completed = 0
+        ok_count = 0
+        fail_count = 0
+        start_time = time.time()
+
+        def _progress_line() -> str:
+            elapsed = time.time() - start_time
+            elapsed_str = _format_duration(elapsed)
+            if 0 < completed < total:
+                eta_str = _format_duration(elapsed * (total - completed) / completed)
+            elif completed >= total:
+                eta_str = "done"
+            else:
+                eta_str = "..."
+            bar_w = 25
+            filled = int(bar_w * completed / total) if total else 0
+            bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
+            pct = int(100 * completed / total) if total else 0
+            return (
+                f" {bar} {pct:3d}% {completed}/{total}"
+                f" | {C.green(f'{ok_count} OK')}"
+                f" | {C.red(f'{fail_count} FAIL')}"
+                f" | {elapsed_str}"
+                f" | ETA: {eta_str}"
+            )
+
+        def _update_progress():
+            if is_tty:
+                sys.stdout.write(f"\r{' ' * term_width}\r{_progress_line()}")
+                sys.stdout.flush()
+
+        def _print_above(text: str):
+            if is_tty:
+                sys.stdout.write(f"\r{' ' * term_width}\r")
+            print(text)
+            _update_progress()
+
+        _update_progress()
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
             futures = {
@@ -309,25 +427,38 @@ class DnsttDnsTester:
                 results.append(result)
                 completed += 1
 
-                status = "OK" if result["success"] else "FAIL"
-                rate = f"{result['successful_attempts']}/{result['attempts']}"
-                avg = (
-                    f"{result['response_time']:.2f}s"
-                    if result["response_time"]
-                    else "N/A"
-                )
-                err = ""
-                if not result["success"] and result.get("error"):
-                    err_msg = result["error"]
-                    # Truncate long error messages for readable output
-                    if len(err_msg) > 80:
-                        err_msg = err_msg[:77] + "..."
-                    err = f" | {err_msg}"
+                if result["success"]:
+                    ok_count += 1
+                    rate = f"{result['successful_attempts']}/{result['attempts']}"
+                    avg = (
+                        f"{result['response_time']:.2f}s"
+                        if result["response_time"]
+                        else "N/A"
+                    )
+                    _print_above(
+                        f"  {C.green('OK')}   {result['dns_server']:>18}"
+                        f" | {rate} | Avg: {avg}"
+                    )
+                else:
+                    fail_count += 1
+                    if self.show_failed:
+                        err_msg = result.get("error", "") or ""
+                        if len(err_msg) > 80:
+                            err_msg = err_msg[:77] + "..."
+                        _print_above(
+                            f"  {C.red('FAIL')} {result['dns_server']:>18}"
+                            + (f" | {C.dim(err_msg)}" if err_msg else "")
+                        )
+                    else:
+                        _update_progress()
 
-                print(
-                    f"[{completed:3d}/{total}] {status:4s} {result['dns_server']:>18} | "
-                    f"{rate} | Avg: {avg}{err}"
-                )
+        # Clear progress bar
+        if is_tty:
+            sys.stdout.write(f"\r{' ' * term_width}\r")
+            sys.stdout.flush()
+
+        elapsed = time.time() - start_time
+        print(f"\nCompleted in {C.bold(_format_duration(elapsed))}")
 
         # Sort: successful first (by avg response time), then failed
         results.sort(
@@ -345,18 +476,19 @@ class DnsttDnsTester:
         return list(getattr(self, "_results", []))
 
     def print_summary(self, results: List[Dict]):
+        C = _Colors(self.use_color)
         successful = [r for r in results if r["success"]]
         failed = [r for r in results if not r["success"]]
 
         print("\n" + "=" * 80)
-        print("SUMMARY")
+        print(C.bold("SUMMARY"))
         print("=" * 80)
         print(f"Total tested:  {len(results)}")
-        print(f"Working:       {len(successful)}")
-        print(f"Failed:        {len(failed)}")
+        print(f"Working:       {C.green(str(len(successful)))}")
+        print(f"Failed:        {C.red(str(len(failed)))}")
 
         if successful:
-            print("\nWorking DNS servers (sorted by speed):")
+            print(f"\n{C.bold('Working DNS servers (sorted by speed):')}")
             print(
                 f"{'DNS Server':>20}  {'Avg':>8}  {'Min':>8}  {'Max':>8}  {'Rate':>6}"
             )
@@ -366,7 +498,8 @@ class DnsttDnsTester:
                 mn = f"{r['min_time']:.2f}s" if r["min_time"] else "N/A"
                 mx = f"{r['max_time']:.2f}s" if r["max_time"] else "N/A"
                 rate = f"{r['successful_attempts']}/{r['attempts']}"
-                print(f"{r['dns_server']:>20}  {avg:>8}  {mn:>8}  {mx:>8}  {rate:>6}")
+                ip = f"{r['dns_server']:>20}"
+                print(f"{C.green(ip)}  {avg:>8}  {mn:>8}  {mx:>8}  {rate:>6}")
 
     def save_results(self, results: List[Dict], path: str):
         with open(path, "w") as f:
@@ -474,6 +607,18 @@ def main():
         default="working_dns_servers.txt",
         help="Output file for working DNS server IPs (default: working_dns_servers.txt)",
     )
+    p.add_argument(
+        "--show-failed",
+        action="store_true",
+        default=False,
+        help="Show failed DNS servers in output (hidden by default)",
+    )
+    p.add_argument(
+        "--no-color",
+        action="store_true",
+        default=False,
+        help="Disable colored output",
+    )
 
     args = p.parse_args()
 
@@ -498,14 +643,20 @@ def main():
         test_timeout=args.test_timeout,
         attempts=args.attempts,
         test_url=args.test_url,
+        show_failed=args.show_failed,
+        use_color=not args.no_color,
     )
 
     try:
         results = tester.run_tests()
     except KeyboardInterrupt:
+        if sys.stdout.isatty():
+            w = shutil.get_terminal_size((80, 24)).columns
+            sys.stdout.write(f"\r{' ' * w}\r")
+            sys.stdout.flush()
         results = tester.partial_results
         print(
-            f"\n\nInterrupted! Saving {sum(1 for r in results if r['success'])} working servers found so far..."
+            f"\nInterrupted! Saving {sum(1 for r in results if r['success'])} working servers found so far..."
         )
 
     tester.print_summary(results)

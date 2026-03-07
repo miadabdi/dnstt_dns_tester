@@ -657,6 +657,10 @@ def main():
 
     args = p.parse_args()
 
+    # DEBUG: verify parsed values
+    print(f"[DEBUG] Parsed args: max_concurrent={args.max_concurrent}, test_timeout={args.test_timeout}")
+    print(f"[DEBUG] Script location: {os.path.abspath(__file__)}")
+
     if not os.path.isfile(args.dnstt):
         print(f"Error: dnstt binary not found: {args.dnstt}")
         sys.exit(1)

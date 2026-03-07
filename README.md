@@ -1,162 +1,156 @@
 # dnstt DNS Tester
 
-A two-stage toolkit for finding DNS servers that work with [dnstt](https://www.bamsoftware.com/software/dnstt/) — a DNS tunnel for censorship circumvention.
+Two-stage toolkit for finding DNS resolvers that work with [dnstt](https://www.bamsoftware.com/software/dnstt/) tunneling.
 
-## Overview
+## Scripts
 
-| Stage | Script                  | Purpose                                                                              |
-| ----- | ----------------------- | ------------------------------------------------------------------------------------ |
-| 1     | `dnstt-dns-liveness.py` | Filter a large list of DNS IPs down to those that respond with **valid DNS replies** |
-| 2     | `dnstt-dns-tester.py`   | Test each alive DNS server for end-to-end **dnstt** tunnel connectivity              |
-
-Stage 1 validates responses properly (transaction ID, QR bit, RCODE, answer records) — not just "did something reply on port 53".
-
-## Cross-Platform Support
-
-Both scripts run on **Linux**, **macOS**, and **Windows**. Platform-specific
-details (process management, file-descriptor limits, temp paths) are handled
-automatically.
-
-> On macOS or Windows you must compile or download the appropriate `dnstt-client`
-> binary yourself and pass it via `--dnstt`.
+| Script | Role |
+| ----- | ---- |
+| `dnstt-dns-liveness.py` | Stage 1: find resolvers that return valid DNS responses, with optional extended checks |
+| `dnstt-dns-tester.py` | Stage 2: start `dnstt-client` per resolver and test end-to-end connectivity through SOCKS |
+| `subtract_ips.py` | Utility: subtract one IP list from another (`A - B`) |
 
 ## Requirements
 
 - Python 3.7+
-- `requests` with SOCKS support (`pip install requests[socks]`)
-- A compiled `dnstt-client` binary for your platform
-- A working dnstt server with its public key and domain
+- `dnstt-client` binary for your platform
+- `requests`, `PySocks` and dependencies listed in `requirements.txt`
+- dnstt server `--pubkey` and `--domain` for Stage 2
 
-## Installation
+## Install Dependencies
 
-Two install modes are supported:
-
-- Online (preferred): installs from PyPI using `requirements.txt`.
+Online:
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-- Offline (no internet): use the bundled wheels in `vendor/`.
+Offline fallback using bundled wheels:
 
 ```bash
- # Unix
- bash install_deps.sh
+# Linux/macOS
+bash install_deps.sh
 
- # Windows (cmd.exe)
- install_deps.bat
+# Windows (cmd.exe)
+install_deps.bat
 ```
 
-The installer scripts will try an online `pip install -r requirements.txt` first and automatically fall back to the `vendor/` wheels if offline.
+## Stage 1: DNS Liveness
 
-## Quick Start
-
-### Stage 1 — DNS Liveness Check
-
-Filter your DNS list to only those servers that respond with valid DNS replies:
+Basic run:
 
 ```bash
 python3 dnstt-dns-liveness.py \
-    --dns-list all_dns.txt \
-    --output alive_dns.txt \
-    --concurrent 200 \
-    --timeout 5
+  --dns-list all_dns.txt \
+  --output alive_dns.txt
 ```
 
-Key options:
+Extended checks example:
 
-| Flag            | Default                 | Description                            |
-| --------------- | ----------------------- | -------------------------------------- |
-| `--dns-list`    | `dns-servers.txt`       | Input file with DNS IPs (one per line) |
-| `--output`      | `alive_dns_servers.txt` | Output file for alive IPs              |
-| `--output-json` | _(none)_                | Save full results as JSON              |
-| `--concurrent`  | 50                      | Max parallel checks                    |
-| `--timeout`     | 5.0                     | Seconds per query                      |
-| `--attempts`    | 2                       | Retries per server                     |
-| `--show-failed` | off                     | Show failed servers in output          |
-| `--no-color`    | off                     | Disable colored terminal output        |
+```bash
+python3 dnstt-dns-liveness.py \
+  --dns-list all_dns.txt \
+  --output alive_dns.txt \
+  --check-nxdomain \
+  --check-edns \
+  --check-censorship \
+  --censorship-domain facebook.com \
+  --censorship-prefix 10.10.
+```
 
-### Stage 2 — dnstt Connectivity Test
+Stage 1 options:
 
-Test alive servers for actual dnstt tunnel connectivity:
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--dns-list` | `dns-servers.txt` | Input IP list (one per line) |
+| `--dns-port` | `53` | DNS port |
+| `--concurrent` | `50` | Max concurrent checks |
+| `--timeout` | `5.0` | Query timeout in seconds |
+| `--attempts` | `2` | Retries per resolver |
+| `--output` | `alive_dns_servers.txt` | Alive resolver output |
+| `--output-json` | none | Full JSON results (auto-set when extended checks are enabled) |
+| `--check-nxdomain` | off | NXDOMAIN hijack detection |
+| `--check-edns` | off | EDNS support test (512/900/1232) |
+| `--check-delegation` | off | Delegation recursion check for tunnel domain |
+| `--domain` | none | Domain used by `--check-delegation` |
+| `--filter-delegation` | off | Keep only delegation-passing resolvers |
+| `--check-censorship` | off | Detect blocked-prefix DNS answers |
+| `--censorship-domain` | `facebook.com` | Domain used for censorship check |
+| `--censorship-prefix` | `10.10.` | Blocked IP prefix marker |
+| `--filter-censorship` | off | Keep only non-censored resolvers |
+| `--show-failed` | off | Print failed resolver rows |
+| `--no-color` | off | Disable ANSI colors |
+
+Stage 1 always writes extra category files derived from `--output`:
+
+- `*_alive_only.txt`
+- `*_clean.txt`
+- `*_nx_ok.txt`
+- `*_ns_ok.txt`
+
+## Stage 2: dnstt Connectivity
 
 ```bash
 python3 dnstt-dns-tester.py \
-    --dnstt PATH_TO_DNSTT_BINARY \
-    --dns-list alive_dns.txt \
-    --pubkey YOUR_PUBLIC_KEY \
-    --domain your.dnstt.domain \
-    --max-concurrent 10 \
-    --attempts 2
+  --dnstt ./dnstt-client-linux-amd64 \
+  --dns-list alive_dns.txt \
+  --pubkey YOUR_PUBLIC_KEY \
+  --domain your.dnstt.domain \
+  --protocol udp \
+  --max-concurrent 3
 ```
 
-Key options:
+Stage 2 options:
 
-| Flag               | Default                                | Description                       |
-| ------------------ | -------------------------------------- | --------------------------------- |
-| `--dnstt`          | `./dnstt-client-linux-amd64`           | Path to dnstt-client binary       |
-| `--dns-list`       | `dns-servers.txt`                      | Input file with DNS IPs           |
-| `--pubkey`         | _(required)_                           | dnstt server public key           |
-| `--domain`         | _(required)_                           | dnstt domain                      |
-| `--dns-port`       | 53                                     | DNS port                          |
-| `--protocol`       | `udp`                                  | Transport: `udp`, `dot`, or `doh` |
-| `--max-concurrent` | 3                                      | Parallel tests                    |
-| `--attempts`       | 2                                      | HTTP attempts per server          |
-| `--test-timeout`   | 90.0                                   | Overall timeout per server        |
-| `--output`         | `dns_test_results.json`                | Full results JSON                 |
-| `--output-working` | `working_dns_servers.txt`              | Working server IPs                |
-| `--test-url`       | `https://www.gstatic.com/generate_204` | URL for connectivity test         |
-| `--show-failed`    | off                                    | Show failed servers in output     |
-| `--no-color`       | off                                    | Disable colored terminal output   |
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--dnstt` | `./dnstt-client-linux-amd64` | Path to `dnstt-client` binary |
+| `--dns-list` | `dns-servers.txt` | Input IP list |
+| `--pubkey` | required | dnstt server pubkey |
+| `--domain` | required | dnstt server domain |
+| `--dns-port` | `53` | Resolver DNS port |
+| `--protocol` | `udp` | `udp`, `dot`, or `doh` |
+| `--startup-wait` | `2.0` | Wait before considering startup failure |
+| `--http-timeout` | `15.0` | HTTP request timeout |
+| `--max-concurrent` | `3` | Parallel resolver tests |
+| `--test-timeout` | `90.0` | Per-resolver overall timeout |
+| `--attempts` | `2` | HTTP attempts per resolver |
+| `--test-url` | `https://www.gstatic.com/generate_204` | Connectivity URL |
+| `--output` | `dns_test_results.json` | Full JSON results |
+| `--output-working` | `working_dns_servers.txt` | Working resolver IPs |
+| `--show-failed` | off | Print failed resolver rows |
+| `--no-color` | off | Disable ANSI colors |
 
-## Terminal UI
-
-Both scripts feature a clean terminal interface:
-
-- **Live progress bar** with percentage, counts, elapsed time, and ETA
-- **Color-coded output** — green for OK/alive, red for FAIL/dead (auto-disabled when piped)
-- **Failures hidden by default** — only working servers are printed; use `--show-failed` to see everything
-- **Graceful Ctrl+C** — any working servers discovered so far are saved before exiting
-
-Example output during a run:
-
-```
-  OK        8.8.8.8  | 2/2 | Avg: 1.23s
-  OK        1.1.1.1  | 2/2 | Avg: 0.98s
- █████░░░░░░░░░░░░░░░░░░░░  20% 1400/6968 | 12 OK | 1388 FAIL | 4m32s | ETA: 18m05s
-```
-
-## High Concurrency Notes
-
-The liveness script is designed to handle 500+ concurrent checks:
-
-- **File descriptor limit** is automatically raised at startup
-- **Random jitter** prevents UDP burst congestion that causes false timeouts
-- **2 attempts by default** compensate for single-packet UDP loss
-- **Per-socket receive buffer** increased to reduce kernel drops
-
-For best results at very high concurrency (500+), also raise the system UDP buffer:
+## Utility: subtract IP lists
 
 ```bash
-sudo sysctl -w net.core.rmem_max=2097152
+python3 subtract_ips.py <file_A> <file_B> <output_file>
 ```
+
+It loads both files as sets and writes sorted `A - B` into `output_file`.
 
 ## Typical Workflow
 
 ```bash
-# 1. Start with a large public DNS list
-wc -l all_dns.txt          # e.g. 116k servers
-
-# 2. Find which ones are alive (valid DNS responders)
+# 1) Liveness + optional filtering
 python3 dnstt-dns-liveness.py --dns-list all_dns.txt --output alive_dns.txt
 
-# 3. Test alive servers with dnstt
-python3 dnstt-dns-tester.py --dns-list alive_dns.txt \
-    --pubkey <key> --domain <domain> --output-working working.txt
+# 2) dnstt functional test
+python3 dnstt-dns-tester.py \
+  --dns-list alive_dns.txt \
+  --dnstt ./dnstt-client-linux-amd64 \
+  --pubkey <pubkey> \
+  --domain <domain> \
+  --output-working working_dns_servers.txt
 
-# 4. Use a working server
-# working.txt now has DNS IPs you can use with dnstt-client
+# 3) Optional list subtraction
+python3 subtract_ips.py alive_dns.txt working_dns_servers.txt remaining.txt
 ```
+
+## Notes
+
+- Both Stage 1 and Stage 2 raise file descriptor limits on POSIX when possible.
+- `dnstt-dns-tester.py` currently prints two debug lines after argument parsing.
 
 ## License
 

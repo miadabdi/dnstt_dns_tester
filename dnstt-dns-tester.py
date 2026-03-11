@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from typing import Dict, List
@@ -126,6 +127,10 @@ class DnsttDnsTester:
         self.test_url = test_url
         self.show_failed = show_failed
         self.use_color = use_color and sys.stdout.isatty()
+        self._results: List[Dict] = []
+        self._stop_event = threading.Event()
+        self._active_processes = set()
+        self._active_processes_lock = threading.Lock()
 
         self.dns_servers = self._load_dns_servers()
 
@@ -140,10 +145,62 @@ class DnsttDnsTester:
                 servers.append(line)
         return servers
 
-    import threading
-
     _port_lock = threading.Lock()
     _reserved_ports: set = set()
+
+    def _interrupted_result(self, dns_server: str) -> Dict:
+        return {
+            "dns_server": dns_server,
+            "success": False,
+            "attempts": 0,
+            "successful_attempts": 0,
+            "error": "Interrupted",
+            "response_time": None,
+            "response_times": [],
+            "min_time": None,
+            "max_time": None,
+        }
+
+    def _register_process(self, process: subprocess.Popen):
+        with self._active_processes_lock:
+            self._active_processes.add(process)
+
+    def _unregister_process(self, process: subprocess.Popen):
+        with self._active_processes_lock:
+            self._active_processes.discard(process)
+
+    def _terminate_process(self, process: subprocess.Popen):
+        if not process or process.poll() is not None:
+            return
+
+        try:
+            if _IS_WIN:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+            else:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    process.wait(timeout=2)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:
+                pass
+
+    def stop(self):
+        self._stop_event.set()
+        with self._active_processes_lock:
+            processes = list(self._active_processes)
+        for process in processes:
+            self._terminate_process(process)
 
     @classmethod
     def _find_free_port(cls) -> int:
@@ -185,9 +242,12 @@ class DnsttDnsTester:
         """Poll until the port is open or timeout is reached."""
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self._stop_event.is_set():
+                return False
             if self._is_port_open(port, timeout=1.0):
                 return True
-            time.sleep(interval)
+            if self._stop_event.wait(timeout=interval):
+                return False
         return False
 
     def test_single_dns(self, dns_server: str) -> Dict:
@@ -200,6 +260,9 @@ class DnsttDnsTester:
         dns_target = f"{dns_server}:{self.dns_port}"
 
         try:
+            if self._stop_event.is_set():
+                return self._interrupted_result(dns_server)
+
             # Build dnstt-client command
             cmd = [
                 self.dnstt_path,
@@ -227,6 +290,7 @@ class DnsttDnsTester:
                 popen_kwargs["preexec_fn"] = os.setsid
 
             dnstt_process = subprocess.Popen(cmd, **popen_kwargs)
+            self._register_process(dnstt_process)
 
             # Wait for dnstt-client to start up and open the SOCKS port
             port_ready = self._wait_for_port(socks_port, timeout=self.startup_wait + 5)
@@ -251,6 +315,9 @@ class DnsttDnsTester:
                     "min_time": None,
                     "max_time": None,
                 }
+
+            if self._stop_event.is_set():
+                return self._interrupted_result(dns_server)
 
             if not port_ready:
                 return {
@@ -285,6 +352,8 @@ class DnsttDnsTester:
             successful_attempts = 0
 
             for i in range(self.attempts):
+                if self._stop_event.is_set():
+                    return self._interrupted_result(dns_server)
                 start = time.time()
                 try:
                     r = session.get(
@@ -301,7 +370,8 @@ class DnsttDnsTester:
                     errors.append(str(e)[:120])
 
                 if i < self.attempts - 1:
-                    time.sleep(2)
+                    if self._stop_event.wait(timeout=2):
+                        return self._interrupted_result(dns_server)
 
             success = successful_attempts > 0
             avg = sum(response_times) / len(response_times) if response_times else None
@@ -326,27 +396,9 @@ class DnsttDnsTester:
                     pass
 
             if dnstt_process and dnstt_process.poll() is None:
-                try:
-                    if _IS_WIN:
-                        dnstt_process.terminate()
-                        try:
-                            dnstt_process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            dnstt_process.kill()
-                            dnstt_process.wait(timeout=2)
-                    else:
-                        os.killpg(os.getpgid(dnstt_process.pid), signal.SIGTERM)
-                        try:
-                            dnstt_process.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(os.getpgid(dnstt_process.pid), signal.SIGKILL)
-                            dnstt_process.wait(timeout=2)
-                except Exception:
-                    try:
-                        dnstt_process.kill()
-                        dnstt_process.wait(timeout=2)
-                    except Exception:
-                        pass
+                self._terminate_process(dnstt_process)
+            if dnstt_process:
+                self._unregister_process(dnstt_process)
 
             # Close stderr temp file to release FD
             if stderr_file:
@@ -362,7 +414,7 @@ class DnsttDnsTester:
             # Release port reservation so other threads can reuse it
             self._release_port(socks_port)
 
-            time.sleep(0.3)
+            self._stop_event.wait(timeout=0.3)
 
     def run_tests(self) -> List[Dict]:
         total = len(self.dns_servers)
@@ -380,7 +432,8 @@ class DnsttDnsTester:
         print(f"  Timeout:    {self.test_timeout}s per DNS server")
         print("-" * 80)
 
-        self._results: List[Dict] = []
+        self._stop_event.clear()
+        self._results = []
         results = self._results
         completed = 0
         ok_count = 0
@@ -421,7 +474,9 @@ class DnsttDnsTester:
 
         _update_progress()
 
-        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+        executor = ThreadPoolExecutor(max_workers=self.max_concurrent)
+        futures = {}
+        try:
             futures = {
                 executor.submit(self.test_single_dns, dns): dns
                 for dns in self.dns_servers
@@ -483,6 +538,13 @@ class DnsttDnsTester:
                         )
                     else:
                         _update_progress()
+        except KeyboardInterrupt:
+            self.stop()
+            for future in futures:
+                future.cancel()
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
         # Clear progress bar
         if is_tty:
@@ -689,6 +751,7 @@ def main():
     try:
         results = tester.run_tests()
     except KeyboardInterrupt:
+        tester.stop()
         if sys.stdout.isatty():
             w = shutil.get_terminal_size((80, 24)).columns
             sys.stdout.write(f"\r{' ' * w}\r")
